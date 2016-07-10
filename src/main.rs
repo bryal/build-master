@@ -3,12 +3,13 @@
 #[macro_use]
 extern crate nickel;
 extern crate libc;
+extern crate getopts;
 
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::process::{self, Command, Child};
 use std::io::{BufRead, BufReader, Error};
-use std::{thread, mem};
+use std::{thread, mem, env};
 use std::sync::mpsc;
 use std::os::unix::process::CommandExt;
 use nickel::{Nickel, HttpRouter, Request, Response, Middleware, MiddlewareResult, MediaType,
@@ -42,20 +43,26 @@ struct BuildServerInner {
 
 impl BuildServerInner {
     fn new() -> BuildServerInner {
-        let mut cmd = Command::new("bash");
-        cmd.arg("/home/bryal/hax/build-master/build-scripts/npm.sh")
+        let mut script_path = env::current_dir().expect("Could not get current dir");
+        script_path.push("build-scripts/npm.sh");
+
+        let mut cmd = Command::new("sh");
+
+        cmd.arg(&script_path)
            .current_dir("/home/bryal/hax/drustse")
            .stdout(process::Stdio::piped())
            .stderr(process::Stdio::piped())
-            // Make the spawned child a leader of its own process group.
-            // Allows for easy killing of forked grandchildren
-            .before_exec(|| if unsafe { libc::setsid() } != -1 {
-                Ok(())
-            } else {
-                Err(Error::last_os_error())
-            });
+           .before_exec(|| {
+               // Make this process the leader of its own group.
+               // Allows for killing of forked grandchildren
+               if unsafe { libc::setsid() } != -1 {
+                   Ok(())
+               } else {
+                   Err(Error::last_os_error())
+               }
+           });
 
-        let mut child = cmd.spawn().expect("Could not execute build command");
+        let mut child = cmd.spawn().expect("Build script execution failed");
 
         let (child_stdout, child_stderr) = (mem::replace(&mut child.stdout, None).unwrap(),
                                             mem::replace(&mut child.stderr, None).unwrap());
@@ -64,8 +71,8 @@ impl BuildServerInner {
         // Spawn output reader in own thread and communicate with channels to prevent blocking
         thread::spawn(move || {
             let stdout_lines = BufReader::new(child_stdout)
-                .lines()
-                .map(|l| l.map(Ok));
+                                   .lines()
+                                   .map(|l| l.map(Ok));
             let stderr_lines = BufReader::new(child_stderr).lines().map(|l| l.map(Err));
 
             for line in stdout_lines.chain(stderr_lines) {
@@ -110,8 +117,8 @@ impl BuildServer {
     /// Get the current output by the child process, both stdout and stderr
     fn output<'mw, D>(&'mw self, mut resp: Response<'mw, D>) -> MiddlewareResult<'mw, D> {
         let BuildServerInner { child_out: ref mut out, output_rx: ref rx, .. } = *self.0
-            .lock()
-            .unwrap();
+                                                                                      .lock()
+                                                                                      .unwrap();
 
         while let Ok(line) = rx.try_recv() {
             if let Ok(s) = line {
@@ -128,7 +135,7 @@ impl BuildServer {
         data.insert("stderr", &out.err);
 
         resp.set(MediaType::Html);
-        resp.render("/home/bryal/hax/build-master/ui/output.tpl", &data)
+        resp.render("ui/output.tpl", &data)
     }
 }
 
@@ -152,11 +159,37 @@ fn root_handler<'mw, D>(_: &mut Request<D>,
                         mut resp: Response<'mw, D>)
                         -> MiddlewareResult<'mw, D> {
     resp.set(MediaType::Html);
-    resp.render("/home/bryal/hax/build-master/ui/index.tpl",
-                &HashMap::<&str, &str>::new())
+    resp.render("ui/index.tpl", &HashMap::<&str, &str>::new())
+}
+
+fn print_usage(program: &str, opts: getopts::Options) {
+    println!("{}",
+             opts.usage(&format!("Usage: {} DATA_DIR [options]", program)));
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let program = args[0].clone();
+
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "print this help menu");
+
+    let matches = opts.parse(&args[1..])
+                      .unwrap_or_else(|e| panic!(e.to_string()));
+    if matches.opt_present("h") {
+        print_usage(&program, opts);
+        return;
+    }
+
+    let data_dir = if !matches.free.is_empty() {
+        matches.free[0].clone()
+    } else {
+        print_usage(&program, opts);
+        return;
+    };
+
+    env::set_current_dir(&data_dir).unwrap_or_else(|e| panic!("{}", e));
+
     let mut server = Nickel::new();
 
     let build_server = BuildServer::new();

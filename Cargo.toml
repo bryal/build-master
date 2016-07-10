@@ -6,3 +6,4 @@ authors = ["bryal <96.bryal@gmail.com>"]
 [dependencies]
 nickel = "0.8"
 libc = "0.2"
+getopts = "0.2"
