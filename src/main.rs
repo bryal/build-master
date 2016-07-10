@@ -1,12 +1,16 @@
+#![feature(process_exec)]
+
 #[macro_use]
 extern crate nickel;
+extern crate libc;
 
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::process::{self, Command, Child};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Error};
 use std::{thread, mem};
 use std::sync::mpsc;
+use std::os::unix::process::CommandExt;
 use nickel::{Nickel, HttpRouter, Request, Response, Middleware, MiddlewareResult, MediaType,
              QueryString};
 
@@ -28,7 +32,6 @@ impl Output {
 type StdoeLine = Result<String, String>;
 
 struct BuildServerInner {
-    redeploy_cmd: Command,
     child: Child,
     child_out: Output,
     /// The receiver half of a channel between a thread reading from std{out,err}.
@@ -37,78 +40,95 @@ struct BuildServerInner {
     output_rx: mpsc::Receiver<StdoeLine>,
 }
 
+impl BuildServerInner {
+    fn new() -> BuildServerInner {
+        let mut cmd = Command::new("bash");
+        cmd.arg("/home/bryal/hax/build-master/build-scripts/npm.sh")
+           .current_dir("/home/bryal/hax/drustse")
+           .stdout(process::Stdio::piped())
+           .stderr(process::Stdio::piped())
+            // Make the spawned child a leader of its own process group.
+            // Allows for easy killing of forked grandchildren
+            .before_exec(|| if unsafe { libc::setsid() } != -1 {
+                Ok(())
+            } else {
+                Err(Error::last_os_error())
+            });
+
+        let mut child = cmd.spawn().expect("Could not execute build command");
+
+        let (child_stdout, child_stderr) = (mem::replace(&mut child.stdout, None).unwrap(),
+                                            mem::replace(&mut child.stderr, None).unwrap());
+        let (tx, rx) = mpsc::channel();
+
+        // Spawn output reader in own thread and communicate with channels to prevent blocking
+        thread::spawn(move || {
+            let stdout_lines = BufReader::new(child_stdout)
+                .lines()
+                .map(|l| l.map(Ok));
+            let stderr_lines = BufReader::new(child_stderr).lines().map(|l| l.map(Err));
+
+            for line in stdout_lines.chain(stderr_lines) {
+                if let Ok(line) = line {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        });
+
+        BuildServerInner {
+            child: child,
+            child_out: Output::new(),
+            output_rx: rx,
+        }
+    }
+}
+
 /// A http handler that manages the building and deployment of services
 struct BuildServer(Mutex<BuildServerInner>);
 
 impl BuildServer {
     fn new() -> BuildServer {
-        let mut cmd = Command::new("sh");
-        cmd.arg("~/hax/build-master/build-scripts/npm.sh")
-           .current_dir("~/hax/drustse")
-           .stdout(process::Stdio::piped())
-           .stderr(process::Stdio::piped());
-
-        let mut child = cmd.spawn().unwrap();
-
-        // let (child_stdout, child_stderr) = (mem::replace(&mut child.stdout, None).unwrap(),
-        //                                     mem::replace(&mut child.stderr, None).unwrap());
-        let (tx, rx) = mpsc::channel();
-
-        // Spawn output reader in own thread and communicate with channels to prevent blocking
-        // thread::spawn(move || {
-        //     let stdout_lines = BufReader::new(child_stdout)
-        //                            .lines()
-        //                            .map(|l| Ok(l.unwrap()));
-        //     let stderr_lines = BufReader::new(child_stderr).lines().map(|l| Err(l.unwrap()));
-
-        //     for line in stdout_lines.chain(stderr_lines) {
-        //         println!("line: {}", line.clone().unwrap());
-        //         tx.send(line);
-        //     }
-        // });
-
-        BuildServer(Mutex::new(BuildServerInner {
-            redeploy_cmd: cmd,
-            child: child,
-            child_out: Output::new(),
-            output_rx: rx,
-        }))
+        BuildServer(Mutex::new(BuildServerInner::new()))
     }
 
     fn redeploy(&self) {
         let mut self_ = self.0.lock().unwrap();
 
-        self_.child.kill();
-        self_.child_out.out.clear();
-        self_.child_out.err.clear();
+        // Kill all processed in the group led by the child
+        // This is required because Child::kill does not kill forked grandchildren
+        unsafe {
+            libc::kill(-(self_.child.id() as i32), libc::SIGINT);
+        }
 
-        self_.child = self_.redeploy_cmd.spawn().unwrap();
+        *self_ = BuildServerInner::new();
     }
 
     /// Get the current output by the child process, both stdout and stderr
     fn output<'mw, D>(&'mw self, mut resp: Response<'mw, D>) -> MiddlewareResult<'mw, D> {
-        let BuildServerInner { child_out: ref mut out,
-                               output_rx: ref rx,
-                               ..} = *self.0
-                                          .lock()
-                                          .unwrap();
+        let BuildServerInner { child_out: ref mut out, output_rx: ref rx, .. } = *self.0
+            .lock()
+            .unwrap();
 
-        // while let Ok(line) = rx.try_recv() {
-        //     if let Ok(s) = line {
-        //         out.out.push_str(&s);
-        //         out.out.push('\n');
-        //     } else if let Err(s) = line {
-        //         out.err.push_str(&s);
-        //         out.err.push('\n');
-        //     }
-        // }
+        while let Ok(line) = rx.try_recv() {
+            if let Ok(s) = line {
+                out.out.push_str(&s);
+                out.out.push('\n');
+            } else if let Err(s) = line {
+                out.err.push_str(&s);
+                out.err.push('\n');
+            }
+        }
 
         let mut data = HashMap::new();
         data.insert("stdout", &out.out);
         data.insert("stderr", &out.err);
 
         resp.set(MediaType::Html);
-        resp.render("~/hax/build-master/ui/output.tpl", &data)
+        resp.render("/home/bryal/hax/build-master/ui/output.tpl", &data)
     }
 }
 
@@ -132,7 +152,7 @@ fn root_handler<'mw, D>(_: &mut Request<D>,
                         mut resp: Response<'mw, D>)
                         -> MiddlewareResult<'mw, D> {
     resp.set(MediaType::Html);
-    resp.render("~/hax/build-master/ui/index.tpl",
+    resp.render("/home/bryal/hax/build-master/ui/index.tpl",
                 &HashMap::<&str, &str>::new())
 }
 
@@ -145,7 +165,7 @@ fn main() {
 
     server.get("/", root_handler);
 
-    let srv = "127.0.0.1:8016";
+    let srv = "0.0.0.0:8016";
 
     server.listen(srv);
 
