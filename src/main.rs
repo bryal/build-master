@@ -5,7 +5,7 @@ extern crate nickel;
 extern crate libc;
 extern crate getopts;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc};
 use std::collections::HashMap;
 use std::process::{self, Command, Child};
 use std::io::{BufRead, BufReader, Error};
@@ -94,6 +94,17 @@ impl BuildServerInner {
     }
 }
 
+impl Drop for BuildServerInner {
+    fn drop(&mut self) {
+        // Kill all processed in the group led by the child
+        // This is required because Child::kill does not kill forked grandchildren
+        println!("DROP");
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGINT);
+        }
+    }
+}
+
 /// A http handler that manages the building and deployment of services
 struct BuildServer(Mutex<BuildServerInner>);
 
@@ -102,20 +113,14 @@ impl BuildServer {
         BuildServer(Mutex::new(BuildServerInner::new()))
     }
 
-    fn redeploy(&self) {
-        let mut self_ = self.0.lock().unwrap();
+    fn redeploy<'mw, D>(&self, mut resp: Response<'mw, D>) -> MiddlewareResult<'mw, D> {
+        *self.0.lock().unwrap() = BuildServerInner::new();
 
-        // Kill all processed in the group led by the child
-        // This is required because Child::kill does not kill forked grandchildren
-        unsafe {
-            libc::kill(-(self_.child.id() as i32), libc::SIGINT);
-        }
-
-        *self_ = BuildServerInner::new();
+        resp.send("success")
     }
 
     /// Get the current output by the child process, both stdout and stderr
-    fn output<'mw, D>(&'mw self, mut resp: Response<'mw, D>) -> MiddlewareResult<'mw, D> {
+    fn child_output<'mw, D>(&self, mut resp: Response<'mw, D>) -> MiddlewareResult<'mw, D> {
         let BuildServerInner { child_out: ref mut out, output_rx: ref rx, .. } = *self.0
                                                                                       .lock()
                                                                                       .unwrap();
@@ -136,22 +141,6 @@ impl BuildServer {
 
         resp.set(MediaType::Html);
         resp.render("ui/output.tpl", &data)
-    }
-}
-
-impl<D> Middleware<D> for BuildServer {
-    fn invoke<'mw>(&'mw self,
-                   req: &mut Request<D>,
-                   resp: Response<'mw, D>)
-                   -> MiddlewareResult<'mw, D> {
-        match req.query().get("action") {
-            Some("redeploy") => {
-                self.redeploy();
-                resp.send("Redeployed!")
-            }
-            _ => self.output(resp),
-        }
-
     }
 }
 
@@ -192,15 +181,19 @@ fn main() {
 
     let mut server = Nickel::new();
 
-    let build_server = BuildServer::new();
+    let build_server = Arc::new(BuildServer::new());
 
-    server.get("/master", build_server);
-
+    let clone = build_server.clone();
+    server.get("/master",
+               middleware!{ |_, resp|
+                   return clone.child_output(resp)
+               });
+    server.post("/master",
+                middleware!{ |_, resp|
+                    return build_server.redeploy(resp)
+                });
     server.get("/", root_handler);
 
-    let srv = "0.0.0.0:8016";
-
-    server.listen(srv);
-
-    println!("Listening on {}", srv);
+    let ip = "0.0.0.0:8016";
+    server.listen(ip);
 }
