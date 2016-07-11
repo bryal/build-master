@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+
+<html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+
+    <body>
+        {{#success}}
+            <button id="redeploy">Redeploy</button>
+
+            <h2>stdout</h2>
+            <pre id="stdout">
+                {{ stdout}}
+            </pre>
+
+            <h2>stderr</h2>
+            <pre id="stderr">
+                {{ stderr}}
+            </pre>
+        {{/success}}
+
+        {{^success}}
+            <button id="redeploy">Deploy</button>
+
+            <h2>Service is not running. Nothing to see here</h2>
+        {{/success}}
+
+        <h2>Description</h2>
+        {{{desc}}}
+
+        <script type="text/javascript">
+         // Send a (re)deployment request to the builder
+         function req_redeploy() {
+             var xhttp = new XMLHttpRequest();
+             xhttp.open("POST", "/builder/{{builder}}", true);
+             xhttp.send();
+         }
+
+         document.getElementById("redeploy").onclick = req_redeploy;
+        </script>
+    </body>
+</html>

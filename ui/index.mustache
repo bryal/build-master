@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+
+<html>
+    <head>
+        <meta charset="UTF-8">
+    </head>
+    <body>
+        <h1>build-master</h1>
+
+        {{^builders_error}}
+            <ul>
+                {{#builders}}
+                    <li><a href="/builder/{{.}}">{{.}}</a></li>
+                {{/builders}}
+            </ul>
+        {{/builders_error}}
+
+        {{#builders_error}}
+            <b>Failed to get builders</b>
+        {{/builders_error}}
+    </body>
+</html>

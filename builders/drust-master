@@ -1,0 +1,7 @@
+#DESC Updates and builds the drust node server hosted at [drust.bryal.xyz](drust.bryal.xyz)
+
+cd /home/bryal/hax/drust-master
+
+git pull
+npm install
+npm start
